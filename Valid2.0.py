@@ -57,12 +57,14 @@ class SQLQueryInspector:
         potential_cartesian_joins = re.findall(join_pattern, self.query, re.IGNORECASE)
         if potential_cartesian_joins:
              if not re.search(r'\bCROSS\s+JOIN\b', self.query, re.IGNORECASE):
-                # Basic check: if 'ON' or 'USING' appears *after* the JOIN keyword in the remaining string, assume okay.
-                # This is a weak heuristic.
                 join_match = re.search(join_pattern, self.query, re.IGNORECASE)
                 if join_match:
                     substring_after_join = self.query[join_match.end():]
-                    if not re.search(r'\b(ON|USING)\b', substring_after_join, re.IGNORECASE | re.DOTALL):
+                    # Check if ON or USING appears *somewhere* after the JOIN match before the next JOIN or end of query section
+                    # This is still a heuristic. A full parse is needed for perfect accuracy.
+                    next_join_match = re.search(r'\bJOIN\b', substring_after_join, re.IGNORECASE)
+                    search_area = substring_after_join if not next_join_match else substring_after_join[:next_join_match.start()]
+                    if not re.search(r'\b(ON|USING)\b', search_area, re.IGNORECASE | re.DOTALL):
                         self.issues.append("Use of JOIN without an ON/USING clause may result in a Cartesian product. Specify join conditions or use CROSS JOIN.")
 
 
@@ -80,144 +82,71 @@ class SQLQueryInspector:
 # --- Aggregate Pattern (Global) ---
 agg_pattern = re.compile(r'^(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(?:\*|\w+|\bDISTINCT\b\s+\w+)\s*\)', re.IGNORECASE)
 
-# --- MODIFIED check_and_clean_columns ---
+# --- check_and_clean_columns (Unchanged) ---
 def check_and_clean_columns(columns_raw, ctes_present, known_base_table_aliases, known_base_table_names):
-    """
-    Cleans column names for validation.
-    **Modification**: If CTEs are present, only adds columns qualified with known
-                      base table names/aliases to the validation list. Skips
-                      unqualified columns or those qualified with unknown prefixes
-                      (assumed CTE aliases). Also skips aggregate function calls.
-    """
     cleaned_columns_for_validation = []
-    # Combine known base table names and their aliases for easier checking
     known_prefixes = known_base_table_aliases.union(known_base_table_names)
-    # print(f"Debug Clean: Known prefixes for validation: {known_prefixes}") # Debug
-
     for col_raw in columns_raw:
-        # print(f"Debug Clean: Processing raw column: {col_raw}") # Debug
-        # Skip aggregate function calls like COUNT(*), SUM(col) etc.
         if agg_pattern.match(col_raw):
-            # print(f"Debug Clean: Skipping aggregate: {col_raw}") # Debug
             continue
-
-        # If CTEs are present, apply stricter filtering for validation list
         if ctes_present:
             if '.' in col_raw:
-                # Split only on the first dot if present
                 parts = col_raw.split('.', 1)
                 prefix = parts[0].lower()
-                col_name = parts[1] # Keep original case temporarily if needed, lowercase later
-
-                # ONLY add for validation if the prefix matches a KNOWN BASE TABLE name or alias
+                col_name = parts[1]
                 if prefix in known_prefixes:
-                    # print(f"Debug Clean: CTE present, known prefix '{prefix}'. Adding '{col_name.lower()}' for validation.") # Debug
                     cleaned_columns_for_validation.append(col_name.lower())
-                # else: # Prefix is unknown (likely CTE alias) - DO NOT add for validation
-                    # print(f"Debug Clean: CTE present, unknown prefix '{prefix}'. Skipping '{col_raw}'.") # Debug
-
-            # else: # No prefix and CTEs are present. Assume it might be from CTE. DO NOT validate.
-                # print(f"Debug Clean: CTE present, no prefix. Skipping '{col_raw}'.") # Debug
-                pass # Explicitly do nothing
-
-        # No CTEs present, process as before (validate almost everything)
         else:
             if '.' in col_raw:
-                # Take only the part after the last dot, lowercase
                 col_name = col_raw.split('.')[-1].lower()
-                # print(f"Debug Clean: No CTEs, dot found. Adding '{col_name}' for validation.") # Debug
                 cleaned_columns_for_validation.append(col_name)
             elif col_raw != '*':
                  col_name = col_raw.lower()
-                 # print(f"Debug Clean: No CTEs, no dot. Adding '{col_name}' for validation.") # Debug
                  cleaned_columns_for_validation.append(col_name)
+    return list(set(cleaned_columns_for_validation))
 
-    # Return unique column names intended for validation against base table schema definitions
-    unique_cols = list(set(cleaned_columns_for_validation))
-    # print(f"Debug Clean: Final columns for validation: {unique_cols}") # Debug
-    return unique_cols
-# --- End Modified check_and_clean_columns ---
-
-
-# --- validate_columns (Unchanged from previous version with strict table check) ---
+# --- validate_columns (Unchanged - Includes user-friendly error message) ---
 def validate_columns(extracted_tables, cleaned_columns_for_validation, table_column_mapping):
-    """
-    Validates if cleaned columns belong to the allowed columns for the extracted BASE tables.
-    Fails validation immediately if any referenced BASE table is not found in the mapping.
-    """
-    # print(f"Debug Validate: Validating tables: {extracted_tables}") # Debug
-    # print(f"Debug Validate: Validating columns: {cleaned_columns_for_validation}") # Debug
     extracted_tables_lower = [t.lower() for t in extracted_tables]
-    valid_columns_for_query = set(['*']) # Base set of allowed columns
-    unknown_tables = [] # List to store tables not found in the mapping
-
-    # --- Check for unknown BASE tables FIRST ---
+    valid_columns_for_query = set(['*'])
+    unknown_tables = []
     for table_name_lower in extracted_tables_lower:
         if table_name_lower in table_column_mapping:
             valid_columns_for_query.update(col.lower() for col in table_column_mapping[table_name_lower])
         else:
             if table_name_lower not in unknown_tables:
                  unknown_tables.append(table_name_lower)
-
     if unknown_tables:
         error_message = f"Query references undefined tables: {', '.join(sorted(unknown_tables))}"
-        # print(f"Debug Validate: Failing due to unknown tables: {unknown_tables}") # Debug
         return False, [error_message]
-    # --- End BASE table check ---
-
-    # If all BASE tables were found, proceed to validate the FILTERED columns.
-    # print(f"Debug Validate: All base tables known. Allowed columns from base tables: {valid_columns_for_query}") # Debug
     invalid_columns = []
-    for col in cleaned_columns_for_validation: # Use the potentially smaller list filtered by check_and_clean_columns
+    for col in cleaned_columns_for_validation:
         if col not in valid_columns_for_query:
-            # Only flag if it's not '*' (already handled) and not an aggregate (already handled)
-            if col != '*':
+             if col != '*':
                 invalid_columns.append(col)
-
     if invalid_columns:
-        # print(f"Debug Validate: Failing due to invalid columns: {invalid_columns}") # Debug
-        return False, list(invalid_columns) # Return False and the list of invalid columns
+        sorted_invalid_cols = sorted(list(set(invalid_columns)))
+        sorted_tables_referenced = sorted(list(set(extracted_tables_lower)))
+        error_message = f"Columns [{', '.join(sorted_invalid_cols)}] are not defined for the referenced tables [{', '.join(sorted_tables_referenced)}]"
+        return False, [error_message]
     else:
-        # print(f"Debug Validate: Passing column validation.") # Debug
-        return True, [] # Return True if all columns are valid
-# --- End validate_columns ---
+        return True, []
 
-
-# --- MODIFIED query_validator ---
+# --- query_validator (Unchanged) ---
 def query_validator(query, local_table_column_mapping):
-    """
-    Main validator function using the centralized mapping.
-    Passes raw columns to check_and_clean_columns along with CTE context.
-    """
     inspector = SQLQueryInspector(query)
     output_query = inspector.inspect_query()
-
     if output_query != query:
-        return output_query # Return the error message from inspector
-
+        return output_query
     else:
         try:
-            # print(f"Debug QueryValidator: Parsing query: {query[:100]}...") # Debug
             parser = Parser(query)
-            # Ensure table names are lowercased immediately for consistent checks
-            # parser.tables extracts BASE tables referenced
             base_tables = [t.lower() for t in parser.tables]
-            columns_raw = parser.columns # Get raw columns from parser (includes prefixes)
-            ctes_present = bool(parser.with_names) # Check if WITH clause exists
-            # Get aliases used for base tables (lowercase keys and values)
+            columns_raw = parser.columns
+            ctes_present = bool(parser.with_names)
             base_table_aliases = {alias.lower() for alias, table in parser.tables_aliases.items() if table.lower() in base_tables}
-            # Get the names of the base tables defined in our mapping
             known_base_table_names = {t.lower() for t in base_tables if t.lower() in local_table_column_mapping}
-
-            # print(f"Debug QueryValidator: Base Tables: {base_tables}") # Debug
-            # print(f"Debug QueryValidator: Raw Columns: {columns_raw}") # Debug
-            # print(f"Debug QueryValidator: CTEs Present: {ctes_present}") # Debug
-            # print(f"Debug QueryValidator: Base Table Aliases: {base_table_aliases}") # Debug
-            # print(f"Debug QueryValidator: Known Base Table Names: {known_base_table_names}") # Debug
-
-
-            # Handle cases like "SELECT 1" or "SELECT func()" which have no tables
-            if not base_tables and not ctes_present: # Modified to check CTEs too
+            if not base_tables and not ctes_present:
                  is_simple_select = True
                  if columns_raw:
                      for c in columns_raw:
@@ -225,47 +154,25 @@ def query_validator(query, local_table_column_mapping):
                               is_simple_select = False
                               break
                  if is_simple_select:
-                     # print("Debug QueryValidator: Passing simple SELECT without tables/CTEs.") # Debug
                      return query
                  else:
-                     # print("Debug QueryValidator: Failing complex SELECT without tables/CTEs.") # Debug
                      return "Validation Error: Columns specified without a valid table or CTE reference."
-
-
-            # If tables or CTEs ARE present, proceed with validation
-            # Pass context to the cleaner function
             columns_cleaned_for_validation = check_and_clean_columns(
-                columns_raw,
-                ctes_present,
-                base_table_aliases,
-                known_base_table_names
+                columns_raw, ctes_present, base_table_aliases, known_base_table_names
             )
-
-            # Validate BASE tables first, then the potentially reduced list of columns
-            # We only pass BASE tables to validate_columns for checking against the mapping
             is_valid, validation_issues = validate_columns(
-                base_tables, # Only check existence of base tables in mapping
-                columns_cleaned_for_validation, # Validate the filtered list of columns
-                local_table_column_mapping
+                base_tables, columns_cleaned_for_validation, local_table_column_mapping
             )
-
             if is_valid:
-                # print("Debug QueryValidator: Validation Passed.") # Debug
-                return query # Return original query if valid
+                return query
             else:
-                # Join the issues list (unknown base tables or invalid columns from base tables)
-                error_msg = f"Validation Error: {', '.join(validation_issues)}"
-                # print(f"Debug QueryValidator: Validation Failed: {error_msg}") # Debug
-                return error_msg
-
+                return f"Validation Error: {', '.join(validation_issues)}"
         except Exception as e:
              print(f"Error during query parsing or validation: {e}")
              if "Unknown token" in str(e) or "Parse" in str(e):
                  return f"Validation Error: Failed to parse the query structure. Check syntax near error mentioned: ({e})"
              else:
                  return f"Validation Error: An unexpected issue occurred during validation. ({e})"
-
-# --- End MODIFIED query_validator ---
 
 
 # --- Direct Test Execution Area ---
@@ -284,32 +191,36 @@ if __name__ == "__main__":
         ["""
          WITH ProductCounts AS (
              SELECT category, COUNT(product_id) as ProdCount
-             FROM ecommerce_product_detail -- BASE TABLE
+             FROM ecommerce_product_detail
              GROUP BY category
          )
-         SELECT pc.category, pc.ProdCount -- Selecting from CTE alias 'pc'
-         FROM ProductCounts pc -- Referencing CTE
+         SELECT pc.category, pc.ProdCount
+         FROM ProductCounts pc
          WHERE pc.ProdCount > 10
-         """, 'Pass'], # <<< EXPECT PASS: 'ProdCount' comes from CTE, validation relaxed.
-        ["SELECT o.username, p.product_name FROM order_view o JOIN ecommerce_product_metadata p ON o.username = p.remediation_owner", 'Pass'],
+         """, 'Pass'],
         ["SELECT 1", 'Pass'],
         ["SELECT count(*) from ecommerce_product_detail", 'Pass'],
         ["SELECT COUNT(*) AS total_count FROM ecommerce_product_detail", 'Pass'],
         ["SELECT category, count(product_id) as NumberOfProducts FROM ecommerce_product_detail GROUP BY category", 'Pass'],
-        # New test: CTE + Join + Selecting from both Base and CTE
+
+        # --- Valid JOIN Cases ---
+        ["SELECT o.username, p.product_name FROM order_view o JOIN ecommerce_product_metadata p ON o.username = p.remediation_owner", 'Pass'],
         ["""
          WITH HighIssues AS (
              SELECT issue_id, username AS user_involved
              FROM order_view
              WHERE issue_level = 'High'
          )
-         SELECT
-            epm.product_name,
-            hi.user_involved -- Column from CTE
+         SELECT epm.product_name, hi.user_involved
          FROM ecommerce_product_metadata epm
          JOIN HighIssues hi ON epm.remediation_owner = hi.user_involved
          WHERE epm.priority = 'Critical'
-        """, 'Pass'], # <<< EXPECT PASS: 'user_involved' from CTE okay, 'product_name'/'remediation_owner'/'priority' checked against base table.
+        """, 'Pass'],
+        ["SELECT epm.product_name, ov.issue_description FROM ecommerce_product_metadata epm LEFT JOIN order_view ov ON epm.product_id = ov.function_id WHERE epm.category = 'Tools'", 'Pass'], # LEFT JOIN
+        ["SELECT epd.item_id, epm.product_name, ov.issue_status FROM ecommerce_product_detail epd JOIN ecommerce_product_metadata epm ON epd.product_id = epm.product_id JOIN order_view ov ON epm.remediation_owner = ov.username WHERE epd.department = 'Garden'", 'Pass'], # Multiple JOINs
+        ["SELECT p1.product_name, p2.product_name FROM ecommerce_product_metadata p1 JOIN ecommerce_product_metadata p2 ON p1.category = p2.category WHERE p1.product_id < p2.product_id", 'Pass'], # Self JOIN
+        ["SELECT epm.product_name, ov.username FROM ecommerce_product_metadata epm CROSS JOIN order_view ov WHERE epm.category = 'Books'", 'Pass'], # CROSS JOIN
+        ["SELECT epd.item_id, epm.product_name FROM ecommerce_product_detail epd JOIN ecommerce_product_metadata epm USING (product_id)", 'Pass'], # JOIN USING
 
         # === Invalid Cases (Inspector Checks) ===
         ["UPDATE ecommerce_product_metadata SET category = 'Outdoor' WHERE product_id = 1", 'Fail'],
@@ -317,40 +228,42 @@ if __name__ == "__main__":
         ["SELECT product_id FROM ecommerce_product_metadata LIMIT 5", 'Fail'],
         ["SELECT product_id; SELECT username FROM order_view", 'Fail'],
         ["SELECT * FROM ecommerce_product_detail WHERE product_id = 1; -- xp_cmdshell('dir')", 'Fail'],
-        ["SELECT p.product_name, u.username FROM ecommerce_product_metadata p JOIN order_view u", 'Fail'],
+        ["SELECT p.product_name, u.username FROM ecommerce_product_metadata p JOIN order_view u", 'Fail'], # JOIN without ON/USING (Inspector check)
 
         # === Invalid Cases (Column/Table/Parse Checks) ===
-        ["SELECT product_id, non_existent_column FROM ecommerce_product_metadata", 'Fail'], # Invalid column from base table
-        ["SELECT * FROM non_existent_table", 'Fail'], # Invalid base table
-        ["SELECT ov.username, ov.bad_column FROM order_view ov", 'Fail'], # Invalid column (via alias) from base table
-        ["SELECT user_id FROM user_data", 'Fail'], # Invalid base table
-        ["SELECT product_id FROM ecommerce_product_metadata m JOIN order_view o ON m.product_id = o.function_id WHERE o.invalid_col = 1", 'Fail'], # Invalid column (via alias) in WHERE
-        ["SELECT COUNT(*) AS total_count, invalid_column FROM ecommerce_product_detail", 'Fail'], # Invalid column alongside aggregate
+        ["SELECT product_id, non_existent_column FROM ecommerce_product_metadata", 'Fail'],
+        ["SELECT * FROM non_existent_table", 'Fail'],
+        ["SELECT ov.username, ov.bad_column FROM order_view ov", 'Fail'],
+        ["SELECT user_id FROM user_data", 'Fail'],
+        ["SELECT product_id FROM ecommerce_product_metadata m JOIN order_view o ON m.product_id = o.function_id WHERE o.invalid_col = 1", 'Fail'], # Invalid column in WHERE
+        ["SELECT COUNT(*) AS total_count, invalid_column FROM ecommerce_product_detail", 'Fail'],
         ["SELECT FROM table", "Fail"], # Parse error
-        ["SELECT col1 FROM ecommerce_product_detail JOIN non_existent_table nx ON nx.id = ecommerce_product_detail.product_id", "Fail"], # Invalid base table in JOIN
-        # New test: CTE + Invalid column selected from BASE table
+        ["SELECT col1 FROM ecommerce_product_detail JOIN non_existent_table nx ON nx.id = ecommerce_product_detail.product_id", "Fail"], # Invalid table in JOIN
         ["""
          WITH ProductCounts AS (
              SELECT category, COUNT(product_id) as ProdCount
              FROM ecommerce_product_detail
              GROUP BY category
          )
-         SELECT
-             pc.ProdCount, -- This is OK (from CTE)
-             epd.non_existent_base_column -- This is INVALID (from base table)
+         SELECT pc.ProdCount, epd.non_existent_base_column
          FROM ProductCounts pc
          JOIN ecommerce_product_detail epd ON pc.category = epd.category
-         """, 'Fail'], # <<< EXPECT FAIL: Tries to select invalid column from base table 'epd'.
-        # New test: CTE + Invalid column selected FROM CTE alias itself
+         """, 'Fail'], # Invalid column from base table joined with CTE
         ["""
          WITH ProductCounts AS (
              SELECT category, COUNT(product_id) as ProdCount
              FROM ecommerce_product_detail
              GROUP BY category
          )
-         SELECT pc.category, pc.InvalidCTEName -- Selecting non-existent column from CTE alias
+         SELECT pc.category, pc.InvalidCTEName
          FROM ProductCounts pc
-         """, 'Pass'], # <<< EXPECT PASS (Limitation): The current logic doesn't validate columns selected FROM CTEs. It only validates columns selected from base tables.
+         """, 'Pass'], # Limitation: Invalid column from CTE itself is not checked
+
+        # --- Invalid JOIN Cases (Column/Table Validation) ---
+        ["SELECT epm.product_name FROM ecommerce_product_metadata epm JOIN order_view ov ON epm.product_id = ov.non_existent_key", 'Fail'], # Invalid column in JOIN ON clause
+        ["SELECT epm.product_name, ov.invalid_column_from_join FROM ecommerce_product_metadata epm JOIN order_view ov ON epm.remediation_owner = ov.username", 'Fail'], # Invalid column in SELECT from joined table
+        ["SELECT p1.product_name, p2.invalid_self_col FROM ecommerce_product_metadata p1 JOIN ecommerce_product_metadata p2 ON p1.category = p2.category WHERE p1.product_id < p2.product_id", 'Fail'], # Invalid column in Self JOIN SELECT
+        ["SELECT epd.item_id, epm.product_name, ov.invalid_multi_join_col FROM ecommerce_product_detail epd JOIN ecommerce_product_metadata epm ON epd.product_id = epm.product_id JOIN order_view ov ON epm.remediation_owner = ov.username WHERE epd.department = 'Garden'", 'Fail'], # Invalid column from 3rd table in multi-join
 
     ]
 
