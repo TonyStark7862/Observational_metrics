@@ -1,0 +1,7 @@
+question,query,data_csv_files,query_category,instructions,glossary,k_shot_prompt
+"How many customers are there in total?","SELECT count(*) FROM customers;",customers.csv,Simple Aggregation,"Return only the count.",,""
+"List product names and their prices, highest first, limited to 3.","SELECT product_name, price FROM products ORDER BY price DESC LIMIT 3;",products.csv,Ordering and Limit,"Limit the result to the top 3 products.",,"Example:\nQ: List users by signup date, newest first, limit 2.\nSQL: SELECT user_name, signup_date FROM users ORDER BY signup_date DESC LIMIT 2;"
+"What is the total revenue from completed orders? Revenue is the sum of order_amount.","SELECT sum(order_amount) FROM orders WHERE status = 'completed';",orders.csv,Filtering Aggregation,"Ensure you only sum orders with status 'completed'.","Revenue: Sum of order_amount for orders marked 'completed'.",
+"Find customers from Chicago whose name starts with C.","SELECT customer_name, email FROM customers WHERE city = 'Chicago' AND customer_name LIKE 'C%';",customers.csv,Filtering with LIKE,"Use case-sensitive LIKE for the name.",,""
+"Join orders and customers on customer_id and show order amount for 'Alice'.","SELECT T1.order_amount FROM orders AS T1 INNER JOIN customers AS T2 ON T1.customer_id = T2.customer_id WHERE T2.customer_name = 'Alice';",orders.csv,customers.csv,Join and Filter,"Use table aliases T1 for orders and T2 for customers.",,""
+
