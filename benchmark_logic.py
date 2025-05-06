@@ -1,7 +1,6 @@
 # benchmark_logic.py
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# from tqdm import tqdm # tqdm might not display well in Streamlit logs, remove direct use
 import time
 import sqlite3
 import os
@@ -9,11 +8,10 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
 # Import necessary functions from existing modules
-# Ensure these paths are correct relative to where this script is run from (usually the root)
-from utils.questions import prepare_questions_df # Use the version adapted for local CSVs
-from utils.llm_abc import call_abc_generator_with_retry, LLMABCResponse # Your generator wrapper
-from eval.local_eval import create_in_memory_db, compare_results_local # Local eval helper
-from utils.gen_prompt import generate_prompt # Rich prompt generator
+from utils.questions import prepare_questions_df
+from utils.llm_abc import call_abc_generator_with_retry, LLMABCResponse
+from eval.local_eval import create_in_memory_db, compare_results_local
+from utils.gen_prompt import generate_prompt
 
 @dataclass
 class BenchmarkConfig:
@@ -21,15 +19,20 @@ class BenchmarkConfig:
     model_identifier: str
     eval_definition_file: str
     data_dir: str
-    prompt_template_file: str
+    prompt_template_file: str # Path to the template file used
     num_questions: Optional[int] = None
     parallel_threads: int = 1
     decimal_points: Optional[int] = None
+    # Add dataset name for logging purposes
+    dataset_name: str = "Unknown Dataset"
 
 @dataclass
 class BenchmarkResultRow:
     """Represents the results for a single evaluation row."""
-    # Input/Config Data (copied from input df)
+    # Input/Config Data (copied from input df + config)
+    model_identifier: str = "" # Added
+    dataset_name: str = "" # Added
+    prompt_template_file: str = "" # Added
     question: str = ""
     query: str = "" # Gold query
     data_csv_files: str = ""
@@ -73,6 +76,14 @@ class BenchmarkResultRow:
 @dataclass
 class BenchmarkSummary:
     """Summary statistics for a benchmark run."""
+    # Configuration used for this run
+    model_identifier: str = ""
+    dataset_name: str = ""
+    prompt_template_file: str = ""
+    run_timestamp: str = "" # Added timestamp
+    output_filename: str = "" # Added filename
+
+    # Performance Metrics
     total_processed: int = 0
     total_correct: int = 0
     total_exact_match: int = 0
@@ -96,43 +107,52 @@ class BenchmarkSummary:
     def exec_error_rate(self) -> float:
         return (self.total_exec_errors / self.total_processed * 100) if self.total_processed > 0 else 0.0
 
+    # Method to create a dictionary representation for display
+    def to_display_dict(self):
+         return {
+             "Run File": os.path.basename(self.output_filename) if self.output_filename else "N/A",
+             "Timestamp": self.run_timestamp,
+             "Model": self.model_identifier,
+             "Dataset": self.dataset_name,
+             "Prompt File": os.path.basename(self.prompt_template_file) if self.prompt_template_file else "N/A",
+             "Accuracy (%)": f"{self.accuracy:.2f}",
+             "Exact Match (%)": f"{self.exact_match_rate:.2f}",
+             "Gen Errors (%)": f"{self.gen_error_rate:.1f}",
+             "Exec Errors (%)": f"{self.exec_error_rate:.1f}",
+             "Avg Latency (s)": f"{self.avg_latency_s:.3f}",
+             "Total Cases": self.total_processed,
+         }
+
 
 def _process_single_row(row_tuple: tuple, config: BenchmarkConfig) -> BenchmarkResultRow:
-    """
-    Internal function to process a single evaluation case.
-    Takes a tuple (index, row_series) and BenchmarkConfig.
-    Returns a BenchmarkResultRow object.
-    """
+    """Internal function to process a single evaluation case."""
     index, row = row_tuple
     result = BenchmarkResultRow.from_dict(row.to_dict())
+    # Add config info to the result row
+    result.model_identifier = config.model_identifier
+    result.dataset_name = config.dataset_name
+    result.prompt_template_file = config.prompt_template_file
 
-    # --- Step 1: Generate Detailed Prompt ---
+    # --- Step 1: Generate Prompt ---
     try:
         schema_str = row.get('schema_string', '')
         aliases_str = row.get('table_aliases_str', '')
         result.schema_string = schema_str
         result.table_aliases_str = aliases_str
-
         prompt = generate_prompt(
             prompt_file=config.prompt_template_file,
-            question=result.question,
-            schema_string=schema_str,
-            db_type='sqlite',
-            instructions=result.instructions or "",
-            k_shot_prompt=result.k_shot_prompt or "",
-            glossary=result.glossary or "",
-            table_aliases_str=aliases_str
+            question=result.question, schema_string=schema_str, db_type='sqlite',
+            instructions=result.instructions or "", k_shot_prompt=result.k_shot_prompt or "",
+            glossary=result.glossary or "", table_aliases_str=aliases_str
         )
         result.prompt_generated = prompt
     except Exception as prompt_err:
-        print(f"Error generating prompt for index {index}: {prompt_err}")
-        result.generation_error_msg = f"PROMPT GENERATION FAILED: {prompt_err}"
+        result.generation_error_msg = f"PROMPT FAILED: {prompt_err}"
         return result
 
     # --- Step 2: Generate SQL ---
     generation_api_result: LLMABCResponse = call_abc_generator_with_retry(
-        model=config.model_identifier,
-        prompt=prompt
+        model=config.model_identifier, prompt=prompt
     )
     result.generated_query = generation_api_result.generated_sql
     result.latency_seconds = generation_api_result.latency_seconds
@@ -140,57 +160,33 @@ def _process_single_row(row_tuple: tuple, config: BenchmarkConfig) -> BenchmarkR
     result.output_tokens = generation_api_result.output_tokens
     result.generation_error_msg = generation_api_result.error_msg if generation_api_result.error_msg else ""
 
-    # --- Step 3: Evaluate if Generation Succeeded ---
+    # --- Step 3: Evaluate ---
     if not result.generation_error_msg and result.generated_query:
-        query_gen = result.generated_query
-        query_gold = result.query
+        query_gen = result.generated_query; query_gold = result.query
         data_csv_paths = row.get('full_data_paths', [])
-
         if not data_csv_paths:
-             result.exec_error_msg = "EVALUATION FAILED: No data CSV paths found for this case."
-             result.error_db_exec = 1
-             return result
-
+            result.exec_error_msg = "EVAL FAILED: No data CSV paths."; result.error_db_exec = 1
+            return result
         conn = None
         try:
             with create_in_memory_db(data_csv_paths) as conn:
                 exact_match, correct_subset = compare_results_local(
-                    conn=conn,
-                    query_gold=query_gold,
-                    query_gen=query_gen,
-                    question=result.question,
-                    query_category=result.query_category,
+                    conn=conn, query_gold=query_gold, query_gen=query_gen,
+                    question=result.question, query_category=result.query_category,
                     decimal_points=config.decimal_points
                 )
-                result.exact_match = int(exact_match)
-                result.correct = int(correct_subset)
-        except (sqlite3.Error, pd.errors.DatabaseError, ValueError, FileNotFoundError) as db_err:
-            print(f"Evaluation Error (DB/Exec/Compare) for index {index}: {db_err}")
-            result.exec_error_msg = f"EVALUATION FAILED: {str(db_err)}"
-            result.error_db_exec = 1
-        except Exception as e:
-            print(f"Unexpected Evaluation Error for index {index}: {e}")
-            result.exec_error_msg = f"UNEXPECTED EVAL ERROR: {str(e)}"
-            result.error_db_exec = 1
+                result.exact_match = int(exact_match); result.correct = int(correct_subset)
+        except Exception as db_err:
+            result.exec_error_msg = f"EVAL FAILED: {str(db_err)}"; result.error_db_exec = 1
     else:
         result.exec_error_msg = "Skipped due to generation error"
 
     return result
 
 def run_benchmark_logic(config: BenchmarkConfig, progress_callback=None) -> tuple[pd.DataFrame, BenchmarkSummary]:
-    """
-    Runs the benchmark evaluation based on the provided configuration.
-
-    Args:
-        config: A BenchmarkConfig object with run parameters.
-        progress_callback: An optional function to call with progress updates.
-
-    Returns:
-        A tuple containing:
-        - pd.DataFrame: DataFrame with detailed results for each case.
-        - BenchmarkSummary: Summary statistics for the run.
-    """
+    """Runs the benchmark evaluation based on the provided configuration."""
     print(f"--- Running Benchmark: Model={config.model_identifier}, EvalFile={config.eval_definition_file} ---")
+    start_run_time = time.time()
 
     try:
         questions_df = prepare_questions_df(
@@ -200,18 +196,20 @@ def run_benchmark_logic(config: BenchmarkConfig, progress_callback=None) -> tupl
         )
     except (FileNotFoundError, ValueError) as e:
         print(f"Error preparing questions: {e}")
-        raise  # Re-raise for the caller (Streamlit UI) to handle
+        raise
 
     input_rows = list(questions_df.iterrows())
     output_rows_list = []
-    summary = BenchmarkSummary()
+    summary = BenchmarkSummary(
+        model_identifier=config.model_identifier,
+        dataset_name=config.dataset_name,
+        prompt_template_file=config.prompt_template_file,
+        # Timestamp will be set at the end
+    )
     all_latencies = []
 
     with ThreadPoolExecutor(max_workers=config.parallel_threads) as executor:
-        futures = [
-            executor.submit(_process_single_row, row_tuple, config)
-            for row_tuple in input_rows
-        ]
+        futures = [ executor.submit(_process_single_row, row_tuple, config) for row_tuple in input_rows ]
         total_tasks = len(futures)
         print(f"Submitting {total_tasks} tasks to {config.parallel_threads} workers...")
 
@@ -219,21 +217,16 @@ def run_benchmark_logic(config: BenchmarkConfig, progress_callback=None) -> tupl
             try:
                 result_row_obj = future.result()
                 output_rows_list.append(result_row_obj.to_dict())
-
                 summary.total_processed += 1
                 if result_row_obj.generation_error_msg: summary.total_gen_errors += 1
                 if result_row_obj.error_db_exec: summary.total_exec_errors += 1
                 if result_row_obj.correct: summary.total_correct += 1
                 if result_row_obj.exact_match: summary.total_exact_match += 1
                 if result_row_obj.latency_seconds > 0: all_latencies.append(result_row_obj.latency_seconds)
-
             except Exception as exc:
                 print(f'Critical error processing future result: {exc}')
-                summary.total_processed += 1
-                summary.total_gen_errors += 1
-
-            if progress_callback:
-                progress_callback((i + 1) / total_tasks)
+                summary.total_processed += 1; summary.total_gen_errors += 1
+            if progress_callback: progress_callback((i + 1) / total_tasks)
 
     print("Benchmark processing complete.")
 
@@ -242,8 +235,8 @@ def run_benchmark_logic(config: BenchmarkConfig, progress_callback=None) -> tupl
         return pd.DataFrame(), summary
 
     output_df = pd.DataFrame(output_rows_list)
-
     summary.avg_latency_s = sum(all_latencies) / len(all_latencies) if all_latencies else 0.0
+    summary.run_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Set completion timestamp
 
     # Define expected columns order
     base_cols = [f.name for f in BenchmarkResultRow.__dataclass_fields__.values() if f.name != 'extra_data']
