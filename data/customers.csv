@@ -1,0 +1,6 @@
+customer_id,customer_name,email,city,signup_date
+1,Alice,alice@example.com,New York,2024-01-15
+2,Bob,bob@example.com,Chicago,2024-02-20
+3,Charlie,charlie@example.com,Chicago,2024-03-10
+4,David,david@example.com,Boston,2024-04-05
+
