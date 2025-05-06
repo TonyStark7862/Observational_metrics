@@ -1,0 +1,7 @@
+order_id,customer_id,order_date,order_amount,status
+1,1,2024-05-01,100.50,completed
+2,3,2024-05-02,75.20,pending
+3,1,2024-05-03,120.00,completed
+4,4,2024-05-04,50.00,completed
+5,2,2024-05-05,200.75,completed
+
