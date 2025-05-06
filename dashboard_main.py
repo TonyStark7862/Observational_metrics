@@ -3,8 +3,7 @@ import streamlit as st
 
 # --- Import the benchmark UI function ---
 try:
-    # Assuming benchmark_ui.py is in the same directory
-    from benchmark_ui import display_benchmark_section # Use the correct function name
+    from benchmark_ui import display_benchmark_section # Renamed function for clarity
     benchmark_available = True
 except ImportError as e:
     print(f"Warning: Could not import benchmark_ui: {e}. Benchmark functionality will be disabled.")
@@ -12,7 +11,6 @@ except ImportError as e:
     # Define a placeholder function
     def display_benchmark_section():
         st.error("Benchmark module ('benchmark_ui.py') could not be loaded. Please ensure it exists and dependencies are met.")
-
 
 # --- Streamlit App Layout ---
 st.set_page_config(layout="wide", page_title="My LLM Application")
@@ -47,7 +45,7 @@ if app_mode == "🏠 Home":
 
 elif app_mode == "📊 Benchmark":
     # Call the function from benchmark_ui.py to render its content
-    display_benchmark_section() # Call the imported function
+    display_benchmark_section()
 
 # Add elif blocks for other sections if you add them later
 # elif app_mode == "⚙️ Settings":
