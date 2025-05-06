@@ -3,6 +3,7 @@ import pandas as pd
 from typing import Optional
 import os
 import sqlite3 # For reading schema from data CSVs
+from .aliases import *
 
 # Import utilities needed for prompt generation inputs
 from .gen_prompt import to_prompt_schema # Keep for potential schema generation if needed
