@@ -1,3 +1,13 @@
+python main.py \
+    -q data/eval_cases.csv \
+    --data_dir data \
+    -f prompts/prompt.md \ # Add the prompt file argument
+    -o results/local_csv_eval_results_rich_prompt.csv \
+    -m "my_custom_sql_gen_v1" \
+    -p 1
+
+
+
 your_project_root/
 │
 ├── main.py                 # Main script to run evaluations (CLI)
