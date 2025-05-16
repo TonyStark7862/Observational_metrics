@@ -435,78 +435,175 @@ Return a 0-10 score and detailed reasoning.
 if __name__ == '__main__':
     print("--- Text-to-SQL Multi-Metric Evaluation Demo (Strict Dynamic Schema Validator) ---")
 
-    comprehensive_schema = """
-    CREATE TABLE Employees (
-        EmployeeID INT PRIMARY KEY, FirstName VARCHAR(50) NOT NULL, LastName VARCHAR(50) NOT NULL,
-        Email VARCHAR(100) UNIQUE, PhoneNumber VARCHAR(20), HireDate DATE, JobID VARCHAR(10),
-        Salary DECIMAL(10, 2), CommissionPct DECIMAL(4, 2), ManagerID INT, DepartmentID INT,
-        FOREIGN KEY (ManagerID) REFERENCES Employees(EmployeeID),
-        FOREIGN KEY (DepartmentID) REFERENCES Departments(DepartmentID)
+    # Realistic e-commerce database schema
+    ecommerce_schema = """
+    CREATE TABLE customers (
+        customer_id INT PRIMARY KEY,
+        first_name VARCHAR(50) NOT NULL,
+        last_name VARCHAR(50) NOT NULL,
+        email VARCHAR(100) UNIQUE,
+        phone VARCHAR(20),
+        address VARCHAR(200),
+        city VARCHAR(50),
+        state VARCHAR(2),
+        zip_code VARCHAR(10),
+        registration_date DATE
     );
-    CREATE TABLE Departments (
-        DepartmentID INT PRIMARY KEY, DepartmentName VARCHAR(50) NOT NULL UNIQUE,
-        ManagerID INT, LocationID INT
+    
+    CREATE TABLE products (
+        product_id INT PRIMARY KEY,
+        product_name VARCHAR(100) NOT NULL,
+        description TEXT,
+        category VARCHAR(50),
+        price DECIMAL(10, 2) NOT NULL,
+        stock_quantity INT DEFAULT 0,
+        supplier_id INT
     );
-    CREATE TABLE JobHistory ( /* LIKE clause was in DDL example, but not in original skip regex */
-        EmployeeID INT, StartDate DATE, EndDate DATE, JobID VARCHAR(10), DepartmentID INT,
-        PRIMARY KEY (EmployeeID, StartDate)
+    
+    CREATE TABLE orders (
+        order_id INT PRIMARY KEY,
+        customer_id INT NOT NULL,
+        order_date TIMESTAMP NOT NULL,
+        status VARCHAR(20) NOT NULL,
+        total_amount DECIMAL(12, 2),
+        shipping_address VARCHAR(200),
+        shipping_city VARCHAR(50),
+        shipping_state VARCHAR(2),
+        shipping_zip VARCHAR(10),
+        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
     );
-    CREATE VIEW EmployeeDepartmentView AS (
-        SELECT e.FirstName, e.LastName, d.DepartmentName
-        FROM Employees e
-        JOIN Departments d ON e.DepartmentID = d.DepartmentID
+    
+    CREATE TABLE order_items (
+        order_id INT,
+        product_id INT,
+        quantity INT NOT NULL,
+        unit_price DECIMAL(10, 2) NOT NULL,
+        PRIMARY KEY (order_id, product_id),
+        FOREIGN KEY (order_id) REFERENCES orders(order_id),
+        FOREIGN KEY (product_id) REFERENCES products(product_id)
     );
-    CREATE TABLE "Order Details" ( "OrderID" INT, "ProductID" INT, "Unit Price" DECIMAL(10,2), Quantity SMALLINT, Discount REAL, PRIMARY KEY ("OrderID", "ProductID"));
-    CREATE TABLE "dbo"."ProductInventory" ( ProductID INT PRIMARY KEY, StockQuantity INT, LastStockDate DATE);
+    
+    CREATE VIEW customer_orders AS (
+        SELECT c.customer_id, c.first_name, c.last_name, 
+               o.order_id, o.order_date, o.total_amount
+        FROM customers c
+        JOIN orders o ON c.customer_id = o.customer_id
+    );
     """
-    empty_schema = "-- This schema is intentionally empty.;"
-    minimal_schema = "CREATE TABLE SimpleItems (ItemID INT, ItemName TEXT);"
-    # This schema will result in an empty map for the validator if generate_table_mapping... can't parse it.
-    unparsable_schema_for_custom_parser = "CRTE TBLE BadSyntax (id INT);" 
     
     test_cases_data = [
-        {"id": "tc001", "use_case": "Valid Simple Select", "schema_name": "comprehensive", "question": "Get all employee first names and last names.", "sql": "SELECT FirstName, LastName FROM Employees;"},
-        {"id": "tc003", "use_case": "Valid JOIN", "schema_name": "comprehensive", "question": "List employees and their department names.", "sql": "SELECT e.FirstName, e.LastName, d.DepartmentName FROM Employees e JOIN Departments d ON e.DepartmentID = d.DepartmentID;"},
-        {"id": "tc005", "use_case": "Valid query with Quoted Table/Columns", "schema_name": "comprehensive", "question": "Get order ID and quantity from order details.", "sql": 'SELECT "OrderID", Quantity FROM "Order Details" WHERE Quantity > 10;'},
-        {"id": "tc006", "use_case": "Query with only literals/functions (no table)", "schema_name": "comprehensive", "question": "What is today's date and the number 42?", "sql": "SELECT CURRENT_DATE, 42 AS TheAnswer;"},
-        {"id": "hc001", "use_case": "Hallucination: Unknown Table", "schema_name": "comprehensive", "question": "Get product information.", "sql": "SELECT ProductName FROM Products;"},
-        {"id": "hc002", "use_case": "Hallucination: Unknown Column", "schema_name": "comprehensive", "question": "Get employee first names and their job titles.", "sql": "SELECT FirstName, JobTitle FROM Employees;"},
-        {"id": "qs001", "use_case": "Safety: DROP Table", "schema_name": "comprehensive", "question": "Remove all job history.", "sql": "DROP TABLE JobHistory;"},
-        {"id": "qs005", "use_case": "Safety: Semicolon hide attempt", "schema_name": "comprehensive", "question": "Find employee with ID 101.", "sql": "SELECT * FROM Employees WHERE EmployeeID = 101; --DROP TABLE Employees"},
-        {"id": "ec001", "use_case": "Query against Empty Schema (no tables in query)", "schema_name": "empty", "question": "Select constant value.", "sql": "SELECT 1 AS test_value;"}, 
-        {"id": "ec001b", "use_case": "Query against Empty Schema (with table in query)", "schema_name": "empty", "question": "Select from non_existent table.", "sql": "SELECT col FROM non_existent_table;"},
-        {"id": "ec002", "use_case": "Unparsable SQL (Syntax Error)", "schema_name": "comprehensive", "question": "Get names.", "sql": "SELEC FirstName FOM Employees"},
-        {"id": "vc001", "use_case": "Valid select from view", "schema_name": "comprehensive", "question": "Get data from employee department view.", "sql": "SELECT FirstName, DepartmentName FROM EmployeeDepartmentView;"},
-        {"id": "dk001", "use_case": "Disallowed Keyword CREATE", "schema_name": "comprehensive", "question": "Trying to create a table via select query.", "sql": "SELECT * FROM Employees; CREATE TABLE Malicious (id INT);"},
-        {"id": "simple001", "use_case": "Simple Select No Table func()", "schema_name": "empty", "question": "Select date func", "sql": "SELECT date()"},
-        {"id": "simple002", "use_case": "Simple Select No Table bad col", "schema_name": "empty", "question": "Select undefined col", "sql": "SELECT undefined_column"},
+        {
+            "id": "ec001", 
+            "use_case": "Valid Simple Select", 
+            "schema_name": "ecommerce", 
+            "question": "List all customer names and emails", 
+            "sql": "SELECT first_name, last_name, email FROM customers;"
+        },
+        {
+            "id": "ec002", 
+            "use_case": "Valid WHERE Clause", 
+            "schema_name": "ecommerce", 
+            "question": "Find products that cost more than $50", 
+            "sql": "SELECT product_name, price FROM products WHERE price > 50;"
+        },
+        {
+            "id": "ec003", 
+            "use_case": "Valid JOIN", 
+            "schema_name": "ecommerce", 
+            "question": "List all orders with customer information", 
+            "sql": "SELECT o.order_id, o.order_date, c.first_name, c.last_name FROM orders o JOIN customers c ON o.customer_id = c.customer_id;"
+        },
+        {
+            "id": "ec004", 
+            "use_case": "Valid Aggregate", 
+            "schema_name": "ecommerce", 
+            "question": "What is the total value of all orders?", 
+            "sql": "SELECT SUM(total_amount) AS total_sales FROM orders;"
+        },
+        {
+            "id": "ec005", 
+            "use_case": "Valid GROUP BY", 
+            "schema_name": "ecommerce", 
+            "question": "How many orders has each customer made?", 
+            "sql": "SELECT customer_id, COUNT(order_id) AS order_count FROM orders GROUP BY customer_id;"
+        },
+        {
+            "id": "ec006", 
+            "use_case": "Valid Complex Query", 
+            "schema_name": "ecommerce", 
+            "question": "What are the top 5 most purchased products?", 
+            "sql": "SELECT p.product_name, SUM(oi.quantity) AS total_quantity FROM products p JOIN order_items oi ON p.product_id = oi.product_id GROUP BY p.product_name ORDER BY total_quantity DESC LIMIT 5;"
+        },
+        {
+            "id": "ec007", 
+            "use_case": "Valid View Query", 
+            "schema_name": "ecommerce", 
+            "question": "Get all customer orders from the view", 
+            "sql": "SELECT customer_id, first_name, last_name, order_id, order_date FROM customer_orders;"
+        },
+        {
+            "id": "ec008", 
+            "use_case": "Invalid Table", 
+            "schema_name": "ecommerce", 
+            "question": "Get information from non-existent table", 
+            "sql": "SELECT * FROM inventory;"
+        },
+        {
+            "id": "ec009", 
+            "use_case": "Invalid Column", 
+            "schema_name": "ecommerce", 
+            "question": "Get customer discount rates", 
+            "sql": "SELECT customer_id, discount_rate FROM customers;"
+        },
+        {
+            "id": "ec010", 
+            "use_case": "Unsafe Operation", 
+            "schema_name": "ecommerce", 
+            "question": "Get customer data and drop products table", 
+            "sql": "SELECT * FROM customers; DROP TABLE products;"
+        }
     ]
 
-    df_test_cases = pd.DataFrame(test_cases_data)
+    schemas = {"ecommerce": ecommerce_schema}
     results_data = []
-    schemas = {"comprehensive": comprehensive_schema, "empty": empty_schema, "minimal": minimal_schema, "unparsable": unparsable_schema_for_custom_parser}
 
-    for index, row in df_test_cases.iterrows():
-        print(f"\nProcessing Test Case ID: {row['id']} ({row['use_case']}) for schema '{row['schema_name']}'")
-        current_schema_str = schemas.get(row['schema_name'], comprehensive_schema) 
-        metrics_json_str = txt2sql_metrics(user_question=row['question'], predicted_sql=row['sql'], db_schema=current_schema_str)
+    for index, row in enumerate(test_cases_data):
+        print(f"\nProcessing Test Case ID: {row['id']} ({row['use_case']})")
+        current_schema_str = schemas.get(row['schema_name'], ecommerce_schema) 
+        metrics_json_str = txt2sql_metrics(
+            user_question=row['question'], 
+            predicted_sql=row['sql'], 
+            db_schema=current_schema_str
+        )
         metrics_list = json.loads(metrics_json_str)
-        row_results = {"test_id": row['id'], "use_case": row['use_case'], "question": row['question'], "predicted_sql": row['sql'], "schema_name_used": row['schema_name'], "full_metrics_json": metrics_json_str}
+        
+        # Create result row
+        row_results = {
+            "test_id": row['id'], 
+            "use_case": row['use_case'], 
+            "question": row['question'], 
+            "predicted_sql": row['sql'], 
+            "schema_name_used": row['schema_name']
+        }
+        
+        # Extract metrics
         for metric in metrics_list:
-            metric_name_slug = metric['name'].lower().replace('(', '').replace(')', '').replace(' ', '_').replace('-', '_')
-            row_results[f"{metric_name_slug}_score"] = metric.get('score')
-            row_results[f"{metric_name_slug}_reason"] = metric.get('reason')
+            metric_name = metric['name'].lower().replace(' ', '_')
+            row_results[f"{metric_name}_score"] = metric.get('score')
+            row_results[f"{metric_name}_reason"] = metric.get('reason', "No reason provided")[:100] + "..."
+        
         results_data.append(row_results)
-
-    df_results = pd.DataFrame(results_data)
-    expected_cols = ["test_id", "use_case", "question", "predicted_sql", "schema_name_used", "comprehensive_sql_validation_score", "comprehensive_sql_validation_reason", "llm_based_sql_evaluation_geval_score", "llm_based_sql_evaluation_geval_reason", "full_metrics_json"]
-    for col in expected_cols: 
-        if col not in df_results.columns: df_results[col] = None 
-    df_results = df_results[expected_cols] 
-
-    csv_filename = "text2sql_evaluation_results_strict_dynamic.csv"
-    try:
-        df_results.to_csv(csv_filename, index=False, encoding='utf-8')
-        print(f"\n--- Evaluation complete. Results saved to '{csv_filename}' ---")
-    except Exception as e:
-        print(f"\n--- Error saving CSV: {e} ---"); print("Dumping results to console instead:"); print(df_results.to_string())
+        
+        # Print result summary
+        print(f"  SQL: {row['sql']}")
+        for metric in metrics_list:
+            print(f"  {metric['name']}: {metric.get('score')} - {metric.get('reason', 'No reason')[:80]}...")
+        
+    print("\n--- Evaluation Summary ---")
+    # Print a summary table of all test cases and their primary validation score
+    print(f"{'ID':<8} {'Use Case':<25} {'Valid?':<10} {'Score':<10}")
+    print("-" * 55)
+    for result in results_data:
+        valid = "No" if result.get('comprehensive_sql_validation_score', 0) > 0 else "Yes"
+        geval_score = result.get('llm_based_sql_evaluation_geval_score', 'N/A')
+        print(f"{result['test_id']:<8} {result['use_case'][:25]:<25} {valid:<10} {geval_score:<10}")
