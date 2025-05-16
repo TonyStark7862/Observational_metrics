@@ -9,6 +9,9 @@ def generate_table_column_mapping_from_ddl(ddl_scripts: str) -> dict:
     Parses DDL CREATE TABLE statements and returns a mapping of table names
     to a list of their column names.
     Includes '*' for all tables.
+    
+    Handles various formats of column definitions from sql-metadata parser
+    and ensures proper fallback to '*' when needed.
     """
     mapping = {}
     if not ddl_scripts or not ddl_scripts.strip():
@@ -24,42 +27,73 @@ def generate_table_column_mapping_from_ddl(ddl_scripts: str) -> dict:
         print(f"Critical Error parsing DDL scripts: {e}")
         return mapping # Return empty mapping on DDL parse failure
 
+    # Try to extract from columns_definitions first (preferred method)
     # Expected structure from sql-metadata for CREATE TABLE:
     # parser.columns_definitions = {'table_name': [{'name': 'col1', ...}, {'name': 'col2', ...}]}
     if hasattr(ddl_parser, 'columns_definitions') and ddl_parser.columns_definitions:
         for table_name, col_defs_list in ddl_parser.columns_definitions.items():
             table_name_lower = table_name.lower()
-            columns = ['*'] # Always allow '*' for every table
-            if isinstance(col_defs_list, list): # Ensure it's a list of column definitions
+            columns = ['*']  # Always allow '*' for every table
+            
+            # Handle different types of column definitions that sql-metadata might return
+            if isinstance(col_defs_list, list):
                 for col_def in col_defs_list:
+                    # Handle dictionary format with 'name' key
                     if isinstance(col_def, dict) and 'name' in col_def:
                         columns.append(col_def['name'].lower())
-                    # sql-metadata might sometimes have simple string list for very simple DDLs
-                    # or different structures for complex DDL parts, but 'name' in dict is typical.
+                    # Handle string format (simple column name)
+                    elif isinstance(col_def, str):
+                        columns.append(col_def.lower())
+            # Handle the case where column definitions are directly provided as strings
+            elif isinstance(col_defs_list, str):
+                columns.append(col_defs_list.lower())
+                
             mapping[table_name_lower] = sorted(list(set(columns)))
+
+    # Alternative extraction: Try to get columns from parser.columns attribute
+    # This is a fallback if columns_definitions doesn't have what we need
+    if hasattr(ddl_parser, 'columns') and ddl_parser.columns:
+        table_columns = {}
+        # Try to associate columns with tables (simplified approach)
+        for col in ddl_parser.columns:
+            # Extract table name if column has table prefix (table.column format)
+            if '.' in col:
+                table_name, col_name = col.split('.', 1)
+                table_name_lower = table_name.lower()
+                if table_name_lower not in table_columns:
+                    table_columns[table_name_lower] = ['*']
+                table_columns[table_name_lower].append(col_name.lower())
+        
+        # Update mapping with columns found
+        for table_name, cols in table_columns.items():
+            if table_name in mapping:
+                # Add to existing columns
+                mapping[table_name] = sorted(list(set(mapping[table_name] + cols)))
+            else:
+                mapping[table_name] = sorted(list(set(cols)))
     
-    # Ensure all tables explicitly mentioned in CREATE TABLE (and parsed by .tables) are in the mapping.
+    # Ensure all tables explicitly mentioned in CREATE TABLE (and parsed by .tables) are in the mapping
     # This handles cases where columns_definitions might miss something or if a table is created
-    # with no columns (unlikely but a safeguard).
+    # with no columns (unlikely but a safeguard)
     for table_name_raw in ddl_parser.tables:
-        table_name_l = table_name_raw.lower()
-        if table_name_l not in mapping:
-            # This could happen if a CREATE TABLE statement was parsed for its name
-            # but its columns weren't detailed in columns_definitions for some reason.
-            print(f"Info: Table '{table_name_l}' detected by parser but not in columns_definitions. Adding with '*' only.")
-            mapping[table_name_l] = ['*']
+        if table_name_raw:  # Ensure table name is not None or empty
+            table_name_l = table_name_raw.lower()
+            if table_name_l not in mapping:
+                # This could happen if a CREATE TABLE statement was parsed for its name
+                # but its columns weren't detailed in columns_definitions for some reason
+                print(f"Info: Table '{table_name_l}' detected by parser but not in columns_definitions. Adding with '*' only.")
+                mapping[table_name_l] = ['*']
             
-    if not mapping and ddl_parser.tables:
-        print("Warning: DDL parser found tables but could not extract column definitions into 'columns_definitions'. Tables will only have '*' as a known column.")
-        for table_name_raw in ddl_parser.tables:
-            mapping[table_name_raw.lower()] = ['*']
+    # Final fallback: If we have tables but somehow no column definitions for them
+    if not any(len(cols) > 1 for cols in mapping.values()) and ddl_parser.tables:
+        print("Warning: DDL parser found tables but could not extract column definitions properly. Tables will only have '*' as a known column.")
+        # Keep the existing mapping which should already have at least '*' for all tables.
+        # No need to add tables again as that was done in the previous step
 
     if not mapping and ddl_scripts.strip():
         print(f"Warning: Could not parse any table/column definitions from the provided DDL.")
 
-
     return mapping
-
 
 # --- SQLQueryInspector Class (Modified) ---
 class SQLQueryInspector:
